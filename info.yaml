@@ -1,8 +1,8 @@
 # Tiny Tapeout project information
 project:
   title:        "SNN-based Atrial Fibrillation Detector with Asystole Alert"
-  author:       ""           # your name here
-  discord:      ""           # your discord username (optional)
+  author:       "sanjay"           # your name here
+  discord:      "sanjaykrishna"           # your discord username (optional)
   description:  "A spiking neural network (SNN) reservoir computing chip that detects atrial fibrillation and asystole in real time from R-peak timing pulses, using 11 LIF neurons, recurrent feedback, and 2-of-3 triple-window majority voting."
   language:     "Verilog"
   clock_hz:     10000000     # 10 MHz
