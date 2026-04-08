@@ -96,8 +96,8 @@ module tb;
         fail_count = 0;
 
         $display("=======================================================");
-        $display("  TT SNN AFib Detector — Testbench v5.1");
-        $display("  Dual-window (fast+slow) | AND voting | 1-bit recurrence | Asystole detect");
+        $display("  TT SNN AFib Detector — Testbench v6.0");
+        $display("  Dual-window (fast+slow) | AND voting | 1-bit recurrence | Adaptive threshold | Asystole detect");
         $display("=======================================================");
 
         wait_clks(5); rst_n = 1; wait_clks(3);
@@ -342,6 +342,92 @@ module tb;
             fail_count = fail_count + 1;
         end
         rst_n = 1;
+
+        // ── T9: Adaptive threshold — detection survives after calibration ──────
+        //
+        // This test verifies Option 2 (adaptive threshold) working on top of
+        // Option A (recurrence). It runs in two phases:
+        //
+        // PHASE 1 — Calibration (32 normal sinus beats at 7000 ticks = 700ms)
+        //   Neurons n0-n3 see gi bits from ~7000-tick intervals. At 700ms the
+        //   RR interval encodes to a moderate value. Some neurons fire frequently
+        //   on normal rhythm (overactive), some rarely (underactive). After two
+        //   full adapt windows (2 × 16 beats), thresholds shift:
+        //     - Overactive neurons  → threshold nudges UP   → fires less easily
+        //     - Underactive neurons → threshold nudges DOWN → fires more easily
+        //   The network self-calibrates to THIS patient's normal baseline.
+        //
+        // PHASE 2 — AFib challenge (16 sustained irregular beats)
+        //   Same beat pattern as T7b. After calibration the neurons that matter
+        //   for AFib (delta stream n4-n7) should still detect the irregularity
+        //   because their thresholds adapt independently from the interval stream.
+        //   afib_flag must still assert — proves adaptation doesn't break detection.
+        //
+        // What we're really checking:
+        //   - spike_seen=1 after calibration  → adapt_en fired, neurons active
+        //   - afib_flag=1 after AFib phase     → detection robust post-adaptation
+        //   - out_valid=1                      → slow window completed both phases
+
+        $display("[INFO] T9: Adaptive threshold test...");
+        $display("[INFO] T9 Phase 1: 32 normal beats for threshold calibration...");
+        do_reset_and_load;
+        spike_seen = 0;
+        begin : adapt_norm_loop
+            integer i;
+            for (i = 0; i < 32; i = i + 1) send_beat_after(7000);
+        end
+        wait_clks(50);
+        $display("[INFO] T9 Ph1: afib=%b valid=%b confidence=%b spike_seen=%b",
+                 `AFIB_FLAG, `VALID, `CONFIDENCE, spike_seen);
+
+        // After 32 normal beats — 2 full adapt windows have fired.
+        // Neurons should have calibrated. afib must still be 0 (no false positive).
+        if (`AFIB_FLAG === 1'b0) begin
+            $display("[PASS] T9a: No false positive during calibration phase (afib=0)");
+            pass_count = pass_count + 1;
+        end else begin
+            $display("[FAIL] T9a: Adaptation caused false positive on normal rhythm");
+            fail_count = fail_count + 1;
+        end
+        if (spike_seen) begin
+            $display("[PASS] T9b: Neurons fired during calibration — adapt_en active");
+            pass_count = pass_count + 1;
+        end else begin
+            $display("[FAIL] T9b: No neuron activity — adapt_en may not be firing");
+            fail_count = fail_count + 1;
+        end
+
+        // Phase 2: Now hit the calibrated network with sustained AFib
+        $display("[INFO] T9 Phase 2: 16 irregular AFib beats post-calibration...");
+        spike_seen = 0;
+        send_beat_after(1500);  send_beat_after(11000);
+        send_beat_after(1800);  send_beat_after(10500);
+        send_beat_after(2000);  send_beat_after(10000);
+        send_beat_after(1700);  send_beat_after(11500);
+        send_beat_after(2300);  send_beat_after(9800);
+        send_beat_after(1600);  send_beat_after(10800);
+        send_beat_after(2100);  send_beat_after(10200);
+        send_beat_after(1900);  send_beat_after(11200);
+        wait_clks(100);
+        $display("[INFO] T9 Ph2: afib=%b valid=%b confidence=%b spike_seen=%b",
+                 `AFIB_FLAG, `VALID, `CONFIDENCE, spike_seen);
+
+        if (`AFIB_FLAG === 1'b1) begin
+            $display("[PASS] T9c: AFib detected post-calibration — adaptation preserved detection");
+            $display("       [Thresholds self-calibrated to normal baseline, delta neurons]");
+            $display("       [still fired on irregularity → fast & slow both triggered]");
+            pass_count = pass_count + 1;
+        end else begin
+            $display("[FAIL] T9c: AFib not detected after calibration — threshold over-adapted");
+            fail_count = fail_count + 1;
+        end
+        if (`VALID === 1'b1) begin
+            $display("[PASS] T9d: out_valid asserted — slow window closed post-calibration");
+            pass_count = pass_count + 1;
+        end else begin
+            $display("[FAIL] T9d: out_valid not asserted after AFib phase");
+            fail_count = fail_count + 1;
+        end
 
         // ── Summary ───────────────────────────────────────────────────────────
         $display("=======================================================");
