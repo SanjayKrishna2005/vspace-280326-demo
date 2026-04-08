@@ -9,11 +9,12 @@ module tb;
     wire [7:0] uio_oe;
     reg        ena, clk, rst_n;
 
-    `define AFIB_FLAG  uo_out[0]
-    `define VALID      uo_out[1]
-    `define SPIKE_MON  uo_out[2]
-    `define FSM_STATE  uo_out[4:3]
-    `define CONFIDENCE uo_out[7:5]
+    `define AFIB_FLAG    uo_out[0]
+    `define VALID        uo_out[1]
+    `define SPIKE_MON    uo_out[2]
+    `define FSM_STATE    uo_out[4:3]
+    `define CONFIDENCE   uo_out[7:5]
+    `define ASYSTOLE     uio_out[0]
 
     tt_um_snn_afib_detector dut (
         .ui_in(ui_in), .uo_out(uo_out),
@@ -29,20 +30,17 @@ module tb;
         $dumpvars(0, tb);
     end
 
-    //  Persistent spike-activity latch 
     reg spike_seen;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)          spike_seen <= 1'b0;
         else if (`SPIKE_MON) spike_seen <= 1'b1;
     end
 
-    //  Tasks 
+    // ── Tasks ─────────────────────────────────────────────────────────────────
     task wait_clks;
         input integer n;
         integer i;
-        begin
-            for (i = 0; i < n; i = i + 1) @(posedge clk);
-        end
+        begin for (i = 0; i < n; i = i + 1) @(posedge clk); end
     endtask
 
     task send_r_peak;
@@ -54,37 +52,38 @@ module tb;
 
     task send_beat_after;
         input integer ticks;
-        begin
-            wait_clks(ticks);
-            send_r_peak();
-        end
+        begin wait_clks(ticks); send_r_peak(); end
     endtask
 
+    // 24-bit weight SR for 8 neurons × 3 bits each
     task load_weights;
-        input [29:0] weights;
+        input [23:0] weights;
         integer i;
         begin
             @(posedge clk); #1;
             ui_in[1] = 1; ui_in[2] = 0; ui_in[3] = 0;
-            for (i = 29; i >= 0; i = i - 1) begin
-                @(posedge clk); #1;
-                ui_in[2] = weights[i];
-                ui_in[3] = 1;
-                @(posedge clk); #1;
-                ui_in[3] = 0;
+            for (i = 23; i >= 0; i = i - 1) begin
+                @(posedge clk); #1; ui_in[2] = weights[i]; ui_in[3] = 1;
+                @(posedge clk); #1; ui_in[3] = 0;
             end
-            @(posedge clk); #1;
-            ui_in[1] = 0;
+            @(posedge clk); #1; ui_in[1] = 0;
             wait_clks(5);
             $display("[TB] Weights loaded. FSM=%b", `FSM_STATE);
         end
     endtask
 
-    //  Weight constants (10-neuron, 30-bit) 
-    //   n7-9 (recurrent+feedback): +2 = 3'b010
-    //   n3-6 (delta stream):       +3 = 3'b011
-    //   n0-2 (interval stream):    -3, -1, -1 = 3'b101, 3'b111, 3'b111
-    localparam [29:0] AFIB_WEIGHTS = 30'h124DB77F;
+    task do_reset_and_load;
+        begin
+            rst_n = 0; wait_clks(3); rst_n = 1; wait_clks(3);
+            load_weights(AFIB_WEIGHTS);
+            spike_seen = 0;
+        end
+    endtask
+
+    // Trained weights (8 neurons, 3 bits each, MSB first):
+    // n7=0 n6=+1 n5=+2 n4=+1 n3=-3 n2=0 n1=+1 n0=0
+    // Binary: 000 001 010 001 101 000 001 000
+    localparam [23:0] AFIB_WEIGHTS = 24'b000_001_010_001_101_000_001_000;
 
     integer pass_count, fail_count;
 
@@ -96,24 +95,23 @@ module tb;
         pass_count = 0;
         fail_count = 0;
 
-        $display("================================================");
-        $display("  TT SNN AFib Detector — Verification TB v4");
-        $display("  10-neuron | FAST_THRESH=16 | SLOW_THRESH=32");
-        $display("================================================");
+        $display("=======================================================");
+        $display("  TT SNN AFib Detector — Testbench v5.0");
+        $display("  Dual-window (fast+slow) | AND voting | Asystole detect");
+        $display("=======================================================");
 
         wait_clks(5); rst_n = 1; wait_clks(3);
 
-        //  T0: TT bidirectional port constraint 
-        if (uio_out === 8'b0 && uio_oe === 8'b0) begin
-            $display("[PASS] T0: uio_out=0 uio_oe=0");
+        // ── T0: uio direction ─────────────────────────────────────────────────
+        if (uio_oe === 8'b0000_0001) begin
+            $display("[PASS] T0: uio_oe=0x01 — asystole pin correctly set as output");
             pass_count = pass_count + 1;
         end else begin
-            $display("[FAIL] T0: uio_out=%b uio_oe=%b (expected both 0)",
-                     uio_out, uio_oe);
+            $display("[FAIL] T0: uio_oe=%b (expected 00000001)", uio_oe);
             fail_count = fail_count + 1;
         end
 
-        //  T1: FSM starts in LOAD 
+        // ── T1: FSM starts in LOAD ────────────────────────────────────────────
         wait_clks(2);
         if (`FSM_STATE === 2'b00) begin
             $display("[PASS] T1: FSM starts in LOAD (00)");
@@ -123,8 +121,8 @@ module tb;
             fail_count = fail_count + 1;
         end
 
-        //  T2: Weight load → FSM moves to RUN 
-        $display("[INFO] Loading signed weights...");
+        // ── T2: Weight load → FSM to RUN ─────────────────────────────────────
+        $display("[INFO] Loading trained weights (0x%h)...", AFIB_WEIGHTS);
         load_weights(AFIB_WEIGHTS);
         if (`FSM_STATE === 2'b01) begin
             $display("[PASS] T2: FSM moved to RUN (01) after weight load");
@@ -134,45 +132,48 @@ module tb;
             fail_count = fail_count + 1;
         end
 
-        //  T3: Normal sinus rhythm (32 beats = 2 full slow windows) 
-        // Steady 7000 ticks → rr_delta ≈ 0 → delta neurons silent
-        // With FAST_THRESH=16, accumulator should stay well below threshold
-        $display("[INFO] T3: Sending 32 normal beats (7000 ticks each)...");
+        // ── T3: Normal sinus rhythm ───────────────────────────────────────────
+        // 7000 ticks × 100ns = 700ms → 86 BPM. n3 fires (weight -3) per beat.
+        // Both windows accumulate negatively → fast & slow both 0 → afib=0.
+        // tick_count never reaches 16384 → asystole=0.
+        $display("[INFO] T3: 20 normal sinus beats (7000 ticks = 700ms each)...");
         begin : norm_loop
             integer i;
-            for (i = 0; i < 32; i = i + 1) send_beat_after(7000);
+            for (i = 0; i < 20; i = i + 1) send_beat_after(7000);
         end
         wait_clks(50);
-        $display("[INFO] T3: afib=%b valid=%b confidence=%b",
-                 `AFIB_FLAG, `VALID, `CONFIDENCE);
+        $display("[INFO] T3: afib=%b valid=%b asystole=%b confidence=%b",
+                 `AFIB_FLAG, `VALID, `ASYSTOLE, `CONFIDENCE);
 
         if (`VALID === 1'b1) begin
             $display("[PASS] T3a: out_valid asserted — slow window closed");
             pass_count = pass_count + 1;
         end else begin
-            $display("[FAIL] T3a: out_valid=0 — slow window never closed");
+            $display("[FAIL] T3a: out_valid=0");
             fail_count = fail_count + 1;
         end
-
         if (`AFIB_FLAG === 1'b0) begin
-            $display("[PASS] T3b: Normal rhythm correctly classified (afib=0)");
+            $display("[PASS] T3b: Normal rhythm classified correctly (afib=0)");
             pass_count = pass_count + 1;
         end else begin
             $display("[FAIL] T3b: False positive — afib=1 on normal rhythm");
             fail_count = fail_count + 1;
         end
+        if (`ASYSTOLE === 1'b0) begin
+            $display("[PASS] T3c: Asystole=0 during normal 700ms beat interval");
+            pass_count = pass_count + 1;
+        end else begin
+            $display("[FAIL] T3c: Asystole false positive at 700ms");
+            fail_count = fail_count + 1;
+        end
 
-        //  Reset between T3 and T4 for clean accumulator state 
-        $display("[INFO] Reset + reload for clean T4 window...");
-        rst_n = 0; wait_clks(3); rst_n = 1; wait_clks(3);
-        load_weights(AFIB_WEIGHTS);
+        // ── T4: Sustained AFib (32 irregular beats) ───────────────────────────
+        // Alternating short/long intervals → enc_delta=9-15 every beat.
+        // Both fast and slow windows accumulate positively.
+        // fast & slow both assert → afib_flag=1. confidence=111 expected.
+        $display("[INFO] T4: 32 sustained irregular AFib beats...");
+        do_reset_and_load;
 
-        //  T4: AFib rhythm (32 irregular beats) 
-        // Alternating short/long intervals → high rr_delta → delta neurons fire
-        // Expected: accum blows past threshold → afib_flag=1
-        $display("[INFO] T4: Sending 32 irregular AFib beats...");
-
-        // Window 1 (beats 1–16)
         send_beat_after(2500);  send_beat_after(9500);
         send_beat_after(3000);  send_beat_after(8800);
         send_beat_after(2200);  send_beat_after(9200);
@@ -182,7 +183,6 @@ module tb;
         send_beat_after(3200);  send_beat_after(8500);
         send_beat_after(2600);  send_beat_after(9100);
 
-        // Window 2 (beats 17–32)
         send_beat_after(3100);  send_beat_after(8200);
         send_beat_after(2400);  send_beat_after(9600);
         send_beat_after(2700);  send_beat_after(9300);
@@ -196,13 +196,12 @@ module tb;
                  `AFIB_FLAG, `VALID, `CONFIDENCE, spike_seen);
 
         if (`AFIB_FLAG === 1'b1) begin
-            $display("[PASS] T4a: AFib correctly detected (afib=1)");
+            $display("[PASS] T4a: AFib detected by fast & slow window vote (afib=1)");
             pass_count = pass_count + 1;
         end else begin
             $display("[FAIL] T4a: AFib not detected");
             fail_count = fail_count + 1;
         end
-
         if (spike_seen) begin
             $display("[PASS] T4b: Reservoir neurons fired during AFib sequence");
             pass_count = pass_count + 1;
@@ -211,7 +210,7 @@ module tb;
             fail_count = fail_count + 1;
         end
 
-        //  T5: confidence_latch in AFib range 
+        // ── T5: Confidence in AFib range ──────────────────────────────────────
         if (`CONFIDENCE >= 3'b101) begin
             $display("[PASS] T5: confidence_latch in AFib range = %b", `CONFIDENCE);
             pass_count = pass_count + 1;
@@ -221,33 +220,109 @@ module tb;
             fail_count = fail_count + 1;
         end
 
-        //  T6: Reset clears all outputs 
-        rst_n = 0; wait_clks(3);
-        if (`AFIB_FLAG === 1'b0 && `VALID === 1'b0 && `FSM_STATE === 2'b00) begin
-            $display("[PASS] T6: Reset clears afib_flag, out_valid, FSM=LOAD");
+        // ── T6: Asystole detection ────────────────────────────────────────────
+        // 16384 ticks = 1.6384 s (threshold, bit 14 of tick_count).
+        // We wait 17000 ticks without any R-peak.
+        // asystole_flag must assert, then clear on the next beat.
+        $display("[INFO] T6: 17000-tick silence (>1.6384s threshold)...");
+        wait_clks(17000);
+        if (`ASYSTOLE === 1'b1) begin
+            $display("[PASS] T6a: Asystole flag asserted after >16384-tick silence");
             pass_count = pass_count + 1;
         end else begin
-            $display("[FAIL] T6: afib=%b valid=%b fsm=%b after reset",
-                     `AFIB_FLAG, `VALID, `FSM_STATE);
+            $display("[FAIL] T6a: Asystole flag did not assert");
+            fail_count = fail_count + 1;
+        end
+        send_r_peak();
+        wait_clks(3);
+        if (`ASYSTOLE === 1'b0) begin
+            $display("[PASS] T6b: Asystole flag cleared on R-peak arrival");
+            pass_count = pass_count + 1;
+        end else begin
+            $display("[FAIL] T6b: Asystole did not clear after R-peak");
+            fail_count = fail_count + 1;
+        end
+
+        // ── T7a: Specificity — 4 irregular beats, then 12 normal ─────────────
+        // Fast window (beats 1-8): 4 irregular then 4 normal — net likely <=0 → afib_fast=0
+        // Slow window (beats 1-16): 12×(-3) weight from normal beats overwhelms
+        // the 4 irregular beats → afib_slow=0.
+        // fast & slow both 0 → afib_flag=0.
+        // Verifies SPECIFICITY: self-terminating 4-beat burst is not a false positive.
+        $display("[INFO] T7a: Specificity — 4 irregular + 12 normal beats...");
+        do_reset_and_load;
+        send_beat_after(1500);  send_beat_after(11000);
+        send_beat_after(1800);  send_beat_after(10500);
+        begin : spec_loop
+            integer i;
+            for (i = 0; i < 12; i = i + 1) send_beat_after(7000);
+        end
+        wait_clks(100);
+        $display("[INFO] T7a: afib=%b valid=%b confidence=%b",
+                 `AFIB_FLAG, `VALID, `CONFIDENCE);
+        if (`AFIB_FLAG === 1'b0) begin
+            $display("[PASS] T7a: Specificity preserved — 4-beat burst not flagged (afib=0)");
+            $display("       [12 normal beats dominate both windows; fast & slow stay negative]");
+            pass_count = pass_count + 1;
+        end else begin
+            $display("[FAIL] T7a: False positive — 4 irregular beats out of 16 flagged as AFib");
+            fail_count = fail_count + 1;
+        end
+
+        // ── T7b: Sensitivity — 16 sustained irregular beats ──────────────────
+        // All 16 beats irregular → fast window (beats 1-8) sees only irregular → afib_fast=1.
+        // Slow window (beats 1-16) accumulates positively throughout → afib_slow=1.
+        // fast & slow both assert → afib_flag=1.
+        // Verifies SENSITIVITY: sustained AFib across a full slow window is detected.
+        $display("[INFO] T7b: Sensitivity — 16 sustained irregular beats...");
+        do_reset_and_load;
+        send_beat_after(1500);  send_beat_after(11000);
+        send_beat_after(1800);  send_beat_after(10500);
+        send_beat_after(2000);  send_beat_after(10000);
+        send_beat_after(1700);  send_beat_after(11500);
+        send_beat_after(2300);  send_beat_after(9800);
+        send_beat_after(1600);  send_beat_after(10800);
+        send_beat_after(2100);  send_beat_after(10200);
+        send_beat_after(1900);  send_beat_after(11200);
+        wait_clks(100);
+        $display("[INFO] T7b: afib=%b valid=%b confidence=%b",
+                 `AFIB_FLAG, `VALID, `CONFIDENCE);
+        if (`AFIB_FLAG === 1'b1) begin
+            $display("[PASS] T7b: Fast+Slow both detected 16-beat AFib episode (afib=1)");
+            pass_count = pass_count + 1;
+        end else begin
+            $display("[FAIL] T7b: 16-beat sustained AFib episode not detected");
+            fail_count = fail_count + 1;
+        end
+
+        // ── T8: Reset clears all state ────────────────────────────────────────
+        rst_n = 0; wait_clks(3);
+        if (`AFIB_FLAG === 1'b0 && `VALID === 1'b0 &&
+            `FSM_STATE === 2'b00 && `ASYSTOLE === 1'b0) begin
+            $display("[PASS] T8: Reset clears afib_flag, out_valid, asystole, FSM=LOAD");
+            pass_count = pass_count + 1;
+        end else begin
+            $display("[FAIL] T8: afib=%b valid=%b asystole=%b fsm=%b after reset",
+                     `AFIB_FLAG, `VALID, `ASYSTOLE, `FSM_STATE);
             fail_count = fail_count + 1;
         end
         rst_n = 1;
 
-        //  Summary 
-        $display("================================================");
+        // ── Summary ───────────────────────────────────────────────────────────
+        $display("=======================================================");
         $display("  Results: %0d passed, %0d failed", pass_count, fail_count);
         if (fail_count == 0)
             $display("  ALL TESTS PASSED");
         else
             $display("  %0d TEST(S) FAILED — see above", fail_count);
         $display("  Waveform: tb.vcd");
-        $display("================================================");
+        $display("=======================================================");
         #1000; $finish;
     end
 
     initial begin
-        #500_000_000;
-        $display("[TIMEOUT] Simulation exceeded 500 ms budget");
+        #900_000_000;
+        $display("[TIMEOUT] Simulation exceeded 900ms budget");
         $finish;
     end
 
