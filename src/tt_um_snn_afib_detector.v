@@ -1,5 +1,9 @@
 `default_nettype none
 
+// ui_in[7:4] and uio_in are unused by design — TT pin allocation requires
+// the full 8-bit ports to be present even if only a subset are connected.
+// confidence is routed internally through confidence_latch to uo_out[7:5].
+/* verilator lint_off UNUSEDSIGNAL */
 
 module tt_um_snn_afib_detector (
     input  wire [7:0] ui_in,
@@ -94,3 +98,4 @@ module tt_um_snn_afib_detector (
     assign uio_out[0]  = asystole_flag;   // bradycardia / asystole output
 
 endmodule
+/* verilator lint_on UNUSEDSIGNAL */

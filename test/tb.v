@@ -96,8 +96,8 @@ module tb;
         fail_count = 0;
 
         $display("=======================================================");
-        $display("  TT SNN AFib Detector — Testbench v6.0");
-        $display("  Dual-window (fast+slow) | AND voting | 1-bit recurrence | Adaptive threshold | Asystole detect");
+        $display("  TT SNN AFib Detector — Testbench v6.1");
+        $display("  Dual-window (fast+slow) | AND voting | 1-bit recurrence | Shared adaptive threshold (Option B) | Asystole detect");
         $display("=======================================================");
 
         wait_clks(5); rst_n = 1; wait_clks(3);
@@ -343,28 +343,25 @@ module tb;
         end
         rst_n = 1;
 
-        // ── T9: Adaptive threshold — detection survives after calibration ──────
+        // ── T9: Adaptive threshold (Option B) — detection survives calibration ──
         //
-        // This test verifies Option 2 (adaptive threshold) working on top of
-        // Option A (recurrence). It runs in two phases:
+        // Option B uses ONE shared spike_count in reservoir (vs per-neuron in
+        // Option A's original form). Every 16 beats reservoir checks total
+        // any_spike count against HIGH_MARK(10)/LOW_MARK(2) and broadcasts
+        // thresh_up or thresh_dn to ALL neurons simultaneously.
+        // Each neuron has only thresh_adapt (4-bit) — no per-neuron counter.
+        // Gate saving: ~32 cells vs per-neuron spike_count approach.
         //
-        // PHASE 1 — Calibration (32 normal sinus beats at 7000 ticks = 700ms)
-        //   Neurons n0-n3 see gi bits from ~7000-tick intervals. At 700ms the
-        //   RR interval encodes to a moderate value. Some neurons fire frequently
-        //   on normal rhythm (overactive), some rarely (underactive). After two
-        //   full adapt windows (2 × 16 beats), thresholds shift:
-        //     - Overactive neurons  → threshold nudges UP   → fires less easily
-        //     - Underactive neurons → threshold nudges DOWN → fires more easily
-        //   The network self-calibrates to THIS patient's normal baseline.
+        // PHASE 1 — Calibration (32 normal sinus beats at 700ms)
+        //   After 2 × 16-beat windows, shared spike_count reflects overall
+        //   reservoir activity on normal rhythm. thresh_up/dn broadcast adjusts
+        //   all neurons together toward the patient's normal baseline.
         //
         // PHASE 2 — AFib challenge (16 sustained irregular beats)
-        //   Same beat pattern as T7b. After calibration the neurons that matter
-        //   for AFib (delta stream n4-n7) should still detect the irregularity
-        //   because their thresholds adapt independently from the interval stream.
-        //   afib_flag must still assert — proves adaptation doesn't break detection.
+        //   After calibration, AFib must still be detected at same confidence.
         //
-        // What we're really checking:
-        //   - spike_seen=1 after calibration  → adapt_en fired, neurons active
+        // What we check:
+        //   - spike_seen=1 after calibration  → thresh pulses fired, neurons active
         //   - afib_flag=1 after AFib phase     → detection robust post-adaptation
         //   - out_valid=1                      → slow window completed both phases
 

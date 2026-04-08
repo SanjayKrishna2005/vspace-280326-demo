@@ -7,7 +7,7 @@ module readout (
     input  wire        w_load,
     input  wire        w_data,
     input  wire        w_clk,
-    input  wire [7:0]  neuron_spikes,   // reduced from 11 to 8
+    input  wire [7:0]  neuron_spikes,
     input  wire        spike_valid,
     output reg         afib_flag,
     output reg         out_valid,
@@ -17,8 +17,8 @@ module readout (
 );
 
     // ── Parameters ───────────────────────────────────────────────────────────
-    localparam FAST_WINDOW  = 4'd8;             // 8 beats
-    localparam SLOW_WINDOW  = 5'd16;            // 16 beats
+    localparam FAST_WINDOW  = 4'd8;
+    localparam SLOW_WINDOW  = 5'd16;
 
     localparam signed [8:0]  FAST_THRESH  = -9'sd1;
     localparam signed [9:0]  SLOW_THRESH  = -10'sd2;
@@ -32,39 +32,44 @@ module readout (
     reg        w_clk_prev;
     reg        w_load_seen;
 
-    wire [2:0] w0  = weight_sr[ 2: 0];  wire [2:0] w1  = weight_sr[ 5: 3];
-    wire [2:0] w2  = weight_sr[ 8: 6];  wire [2:0] w3  = weight_sr[11: 9];
-    wire [2:0] w4  = weight_sr[14:12];  wire [2:0] w5  = weight_sr[17:15];
-    wire [2:0] w6  = weight_sr[20:18];  wire [2:0] w7  = weight_sr[23:21];
+    wire [2:0] w0 = weight_sr[ 2: 0];  wire [2:0] w1 = weight_sr[ 5: 3];
+    wire [2:0] w2 = weight_sr[ 8: 6];  wire [2:0] w3 = weight_sr[11: 9];
+    wire [2:0] w4 = weight_sr[14:12];  wire [2:0] w5 = weight_sr[17:15];
+    wire [2:0] w6 = weight_sr[20:18];  wire [2:0] w7 = weight_sr[23:21];
 
     // ── Sign-extend 3-bit 2's complement weights to 9-bit signed ─────────────
-    wire signed [8:0] ws0  = {{6{w0[2]}},  w0};
-    wire signed [8:0] ws1  = {{6{w1[2]}},  w1};
-    wire signed [8:0] ws2  = {{6{w2[2]}},  w2};
-    wire signed [8:0] ws3  = {{6{w3[2]}},  w3};
-    wire signed [8:0] ws4  = {{6{w4[2]}},  w4};
-    wire signed [8:0] ws5  = {{6{w5[2]}},  w5};
-    wire signed [8:0] ws6  = {{6{w6[2]}},  w6};
-    wire signed [8:0] ws7  = {{6{w7[2]}},  w7};
+    wire signed [8:0] ws0 = {{6{w0[2]}}, w0};
+    wire signed [8:0] ws1 = {{6{w1[2]}}, w1};
+    wire signed [8:0] ws2 = {{6{w2[2]}}, w2};
+    wire signed [8:0] ws3 = {{6{w3[2]}}, w3};
+    wire signed [8:0] ws4 = {{6{w4[2]}}, w4};
+    wire signed [8:0] ws5 = {{6{w5[2]}}, w5};
+    wire signed [8:0] ws6 = {{6{w6[2]}}, w6};
+    wire signed [8:0] ws7 = {{6{w7[2]}}, w7};
 
     // ── Per-neuron spike contributions (gated by spike presence) ─────────────
-    wire signed [8:0] c0  = neuron_spikes[0] ? ws0 : 9'sd0;
-    wire signed [8:0] c1  = neuron_spikes[1] ? ws1 : 9'sd0;
-    wire signed [8:0] c2  = neuron_spikes[2] ? ws2 : 9'sd0;
-    wire signed [8:0] c3  = neuron_spikes[3] ? ws3 : 9'sd0;
-    wire signed [8:0] c4  = neuron_spikes[4] ? ws4 : 9'sd0;
-    wire signed [8:0] c5  = neuron_spikes[5] ? ws5 : 9'sd0;
-    wire signed [8:0] c6  = neuron_spikes[6] ? ws6 : 9'sd0;
-    wire signed [8:0] c7  = neuron_spikes[7] ? ws7 : 9'sd0;
+    wire signed [8:0] c0 = neuron_spikes[0] ? ws0 : 9'sd0;
+    wire signed [8:0] c1 = neuron_spikes[1] ? ws1 : 9'sd0;
+    wire signed [8:0] c2 = neuron_spikes[2] ? ws2 : 9'sd0;
+    wire signed [8:0] c3 = neuron_spikes[3] ? ws3 : 9'sd0;
+    wire signed [8:0] c4 = neuron_spikes[4] ? ws4 : 9'sd0;
+    wire signed [8:0] c5 = neuron_spikes[5] ? ws5 : 9'sd0;
+    wire signed [8:0] c6 = neuron_spikes[6] ? ws6 : 9'sd0;
+    wire signed [8:0] c7 = neuron_spikes[7] ? ws7 : 9'sd0;
 
     // ── Per-beat signed sum across all 8 neurons ──────────────────────────────
-    wire signed [12:0] cycle_sum =
-        $signed(c0) + $signed(c1) + $signed(c2) + $signed(c3) +
-        $signed(c4) + $signed(c5) + $signed(c6) + $signed(c7);
+    // Each operand explicitly sign-extended to 10 bits before summing to avoid
+    // WIDTHEXPAND lint warnings. Sum is 10 bits — sufficient for 8 × max weight
+    // 3 = 24, well within 10-bit signed range [-512, 511].
+    wire signed [9:0] cycle_sum =
+        {{1{c0[8]}}, c0} + {{1{c1[8]}}, c1} +
+        {{1{c2[8]}}, c2} + {{1{c3[8]}}, c3} +
+        {{1{c4[8]}}, c4} + {{1{c5[8]}}, c5} +
+        {{1{c6[8]}}, c6} + {{1{c7[8]}}, c7};
 
     // Truncated views fed to each window accumulator
-    wire signed [8:0]  cycle_fast = cycle_sum[8:0];   // 9-bit for fast
-    wire signed [9:0]  cycle_slow = cycle_sum[9:0];   // 10-bit for slow
+    wire signed [8:0] cycle_fast = cycle_sum[8:0];   // 9-bit for fast
+    wire signed [9:0] cycle_slow = cycle_sum[9:0];   // 10-bit for slow
 
     // ── Window accumulators ───────────────────────────────────────────────────
     // FAST (8-beat)
@@ -104,7 +109,7 @@ module readout (
             confidence_latch <= 3'b010;
             fsm_state        <= LOAD;
         end else if (ena) begin
-            w_clk_prev  <= w_clk;
+            w_clk_prev <= w_clk;
 
             case (fsm_state)
 
@@ -116,11 +121,11 @@ module readout (
                     if (w_clk & ~w_clk_prev)
                         weight_sr <= {weight_sr[22:0], w_data};
                     if (w_load_seen && !w_load) begin
-                        fsm_state  <= RUN;
-                        accum_fast <= 9'sd0;
-                        accum_slow <= 10'sd0;
-                        beat_fast  <= 4'd0;
-                        beat_slow  <= 5'd0;
+                        fsm_state   <= RUN;
+                        accum_fast  <= 9'sd0;
+                        accum_slow  <= 10'sd0;
+                        beat_fast   <= 4'd0;
+                        beat_slow   <= 5'd0;
                         w_load_seen <= 1'b0;
                     end
                 end
@@ -144,7 +149,7 @@ module readout (
                             beat_fast       <= 4'd0;
                         end
 
-                        // ── SLOW window closes every 16 beats → trigger OUTPUT─
+                        // ── SLOW window closes every 16 beats → OUTPUT ────────
                         if (beat_slow == SLOW_WINDOW - 1) begin
                             afib_slow  <= (accum_slow > SLOW_THRESH);
                             accum_slow <= 10'sd0;
@@ -154,12 +159,12 @@ module readout (
                     end
                 end
 
-                // ── OUTPUT: 2-window majority vote (fast & slow) ──────────────
+                // ── OUTPUT: AND vote — both windows must agree ────────────────
                 OUTPUT: begin
                     confidence_latch <= confidence;
-                    afib_flag  <= afib_fast & afib_slow;
-                    out_valid  <= 1'b1;
-                    fsm_state  <= RUN;
+                    afib_flag        <= afib_fast & afib_slow;
+                    out_valid        <= 1'b1;
+                    fsm_state        <= RUN;
                 end
 
                 default: fsm_state <= LOAD;
