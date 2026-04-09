@@ -72,6 +72,11 @@ module tb;
         end
     endtask
 
+    // Trained weights (8 neurons, 3 bits each, MSB first):
+    // n7=0 n6=+1 n5=+2 n4=+1 n3=-3 n2=0 n1=+1 n0=0
+    // Binary: 000 001 010 001 101 000 001 000
+    localparam [23:0] AFIB_WEIGHTS = 24'b000_001_010_001_101_000_001_000;
+
     task do_reset_and_load;
         begin
             rst_n = 0; wait_clks(3); rst_n = 1; wait_clks(3);
@@ -79,11 +84,6 @@ module tb;
             spike_seen = 0;
         end
     endtask
-
-    // Trained weights (8 neurons, 3 bits each, MSB first):
-    // n7=0 n6=+1 n5=+2 n4=+1 n3=-3 n2=0 n1=+1 n0=0
-    // Binary: 000 001 010 001 101 000 001 000
-    localparam [23:0] AFIB_WEIGHTS = 24'b000_001_010_001_101_000_001_000;
 
     integer pass_count, fail_count;
 

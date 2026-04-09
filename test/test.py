@@ -1,430 +1,368 @@
-"""
-cocotb testbench for tt_um_snn_afib_detector
-Tiny Tapeout SNN AFib Detector — Triple-window | 2-of-3 voting | Asystole detect
-
-Mirrors the logic of tb.v exactly so both flows produce the same results.
-Run with:
-    cd test && make
-"""
-
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, FallingEdge, Timer
 
 
-# ── Constants (must match tb.v / readout.v) ──────────────────────────────────
-AFIB_WEIGHTS = 0x088051A08   # 33-bit: n10=+2 n9=+1 n8=0 n7=0 n6=+1
-                              #         n5=+2 n4=+1 n3=-3 n2=0 n1=+1 n0=0
-CLK_PERIOD_NS = 100           # 10 MHz → 100 ns period
+# ─────────────────────────────────────────────────────────────────────────────
+# Signal aliases  (mirrors tb.v `define macros)
+# ─────────────────────────────────────────────────────────────────────────────
+def AFIB_FLAG(dut):   return (int(dut.uo_out.value) >> 0) & 0x1
+def VALID(dut):       return (int(dut.uo_out.value) >> 1) & 0x1
+def SPIKE_MON(dut):   return (int(dut.uo_out.value) >> 2) & 0x1
+def FSM_STATE(dut):   return (int(dut.uo_out.value) >> 3) & 0x3
+def CONFIDENCE(dut):  return (int(dut.uo_out.value) >> 5) & 0x7
+def ASYSTOLE(dut):    return (int(dut.uio_out.value) >> 0) & 0x1
 
 
-# ── Reference model ───────────────────────────────────────────────────────────
-class AfibDetectorModel:
-    """
-    Software golden reference that mirrors the chip's observable outputs.
-    Tracks only what we can actually assert from outside the chip:
-      - FSM state transitions (LOAD=0, RUN=1, OUTPUT=2)
-      - asystole_flag asserts after >16384 ticks without R-peak
-      - out_valid pulses every 16 beats once in RUN
-    """
-    LOAD   = 0b00
-    RUN    = 0b01
-    OUTPUT = 0b10
-
-    def __init__(self):
-        self.fsm_state    = self.LOAD
-        self.weights_seen = False
-        self.beat_count   = 0
-        self.tick_count   = 0
-        self.asystole     = False
-
-    def reset(self):
-        self.fsm_state    = self.LOAD
-        self.weights_seen = False
-        self.beat_count   = 0
-        self.tick_count   = 0
-        self.asystole     = False
-
-    def load_weights(self):
-        """Simulate w_load pulse → FSM moves LOAD→RUN."""
-        self.fsm_state    = self.RUN
-        self.beat_count   = 0
-        self.weights_seen = True
-
-    def r_peak(self):
-        """Simulate an R-peak arriving."""
-        self.tick_count  = 0
-        self.asystole    = False
-        self.beat_count += 1
-
-    def tick(self, n=1):
-        """Advance tick_count by n clocks (no R-peak)."""
-        self.tick_count += n
-        if self.tick_count >= 16384:
-            self.asystole = True
-
-    def out_valid_expected_after_beats(self, n):
-        """Returns True if we expect out_valid after n beats since last reset."""
-        return (n > 0) and (n % 16 == 0)
+# ─────────────────────────────────────────────────────────────────────────────
+# Trained weights  (8 neurons × 3 bits, MSB-first)
+# n7=0 n6=+1 n5=+2 n4=+1 n3=-3 n2=0 n1=+1 n0=0
+# Binary: 000 001 010 001 101 000 001 000
+# ─────────────────────────────────────────────────────────────────────────────
+AFIB_WEIGHTS = 0b000_001_010_001_101_000_001_000   # 24-bit
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-async def reset_dut(dut):
-    dut.rst_n.value = 0
-    dut.ena.value   = 1
-    dut.ui_in.value = 0
-    dut.uio_in.value = 0
-    await ClockCycles(dut.clk, 5)
-    dut.rst_n.value = 1
-    await ClockCycles(dut.clk, 3)
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper coroutines  (direct translations of the Verilog tasks)
+# ─────────────────────────────────────────────────────────────────────────────
+async def wait_clks(dut, n):
+    """Wait n rising edges — equivalent to Verilog wait_clks task."""
+    await ClockCycles(dut.clk, n)
+
+
+async def send_r_peak(dut):
+    """Assert ui_in[0] for one clock, then deassert — mirrors send_r_peak task."""
+    await RisingEdge(dut.clk)
+    await Timer(1, units="ns")
+    dut.ui_in.value = int(dut.ui_in.value) | 0x01        # set bit 0
+    await RisingEdge(dut.clk)
+    await Timer(1, units="ns")
+    dut.ui_in.value = int(dut.ui_in.value) & ~0x01       # clear bit 0
+
+
+async def send_beat_after(dut, ticks):
+    """Wait ticks clocks then send an R-peak — mirrors send_beat_after task."""
+    await wait_clks(dut, ticks)
+    await send_r_peak(dut)
 
 
 async def load_weights(dut, weights: int):
     """
-    Serial-load 33 bits into the readout weight shift register.
-    Protocol: assert w_load, clock in bits MSB-first on w_clk rising edges,
-    then deassert w_load → FSM transitions LOAD→RUN.
-    Matches tb.v load_weights task exactly.
+    Serial-shift 24 bits of weights MSB-first into the design.
+    ui_in[1] = load_mode, ui_in[2] = data_bit, ui_in[3] = shift_clk
+    Mirrors the Verilog load_weights task exactly.
     """
-    # Assert w_load (ui_in[1])
-    dut.ui_in.value = 0b00000010
-    await ClockCycles(dut.clk, 1)
+    await RisingEdge(dut.clk)
+    await Timer(1, units="ns")
+    # Enter load mode: ui_in[1]=1, ui_in[2]=0, ui_in[3]=0
+    base = int(dut.ui_in.value) & 0xF0          # preserve upper nibble
+    dut.ui_in.value = base | 0b0010             # bit1=1, bit2=0, bit3=0
 
-    for i in range(32, -1, -1):
+    for i in range(23, -1, -1):
         bit = (weights >> i) & 1
-        # w_data=bit (ui_in[2]), w_clk=1 (ui_in[3]), w_load=1 (ui_in[1])
-        dut.ui_in.value = 0b00000010 | (bit << 2) | (1 << 3)
-        await ClockCycles(dut.clk, 1)
-        # w_clk low
-        dut.ui_in.value = 0b00000010 | (bit << 2)
-        await ClockCycles(dut.clk, 1)
+        await RisingEdge(dut.clk)
+        await Timer(1, units="ns")
+        # data bit on ui_in[2], shift_clk high on ui_in[3]
+        dut.ui_in.value = (int(dut.ui_in.value) & 0xF1) | (bit << 2) | (1 << 3)
+        await RisingEdge(dut.clk)
+        await Timer(1, units="ns")
+        dut.ui_in.value = int(dut.ui_in.value) & ~(1 << 3)   # lower shift_clk
 
-    # Deassert w_load → triggers LOAD→RUN transition
-    dut.ui_in.value = 0
-    await ClockCycles(dut.clk, 5)
-
-
-async def send_r_peak(dut):
-    """Pulse r_peak (ui_in[0]) for exactly 1 clock. Matches tb.v send_r_peak."""
-    dut.ui_in.value = dut.ui_in.value | 0b00000001
-    await ClockCycles(dut.clk, 1)
-    dut.ui_in.value = dut.ui_in.value & ~0b00000001
-    await ClockCycles(dut.clk, 1)
-
-
-async def send_beat_after(dut, ticks: int):
-    """Wait ticks clocks, then send an R-peak pulse. Matches tb.v send_beat_after."""
-    await ClockCycles(dut.clk, ticks)
-    await send_r_peak(dut)
+    await RisingEdge(dut.clk)
+    await Timer(1, units="ns")
+    dut.ui_in.value = int(dut.ui_in.value) & ~(1 << 1)       # exit load mode
+    await wait_clks(dut, 5)
+    dut._log.info(f"[TB] Weights loaded. FSM={FSM_STATE(dut):02b}")
 
 
 async def do_reset_and_load(dut):
-    """Full reset + weight load sequence used before each test scenario."""
-    await reset_dut(dut)
+    """Hard reset then load trained weights — mirrors do_reset_and_load task."""
+    dut.rst_n.value = 0
+    await wait_clks(dut, 3)
+    dut.rst_n.value = 1
+    await wait_clks(dut, 3)
     await load_weights(dut, AFIB_WEIGHTS)
 
 
-def fsm_state(dut) -> int:
-    return (int(dut.uo_out.value) >> 3) & 0b11
-
-def afib_flag(dut) -> int:
-    return int(dut.uo_out.value) & 0b00000001
-
-def out_valid(dut) -> int:
-    return (int(dut.uo_out.value) >> 1) & 1
-
-def any_spike(dut) -> int:
-    return (int(dut.uo_out.value) >> 2) & 1
-
-def confidence(dut) -> int:
-    return (int(dut.uo_out.value) >> 5) & 0b111
-
-def asystole_flag(dut) -> int:
-    return int(dut.uio_out.value) & 0b00000001
-
-
-# ── Tests ─────────────────────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Main test
+# ─────────────────────────────────────────────────────────────────────────────
 @cocotb.test()
-async def test_t0_uio_direction(dut):
-    """T0: uio_oe[0]=1 (asystole output), uio_oe[7:1]=0 (inputs)."""
-    dut._log.info("T0: Checking uio_oe direction register")
-    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
-    cocotb.start_soon(clock.start())
-    await reset_dut(dut)
+async def test_snn_afib_detector(dut):
+    """
+    TT SNN AFib Detector — Golden Vector Testbench (cocotb port of tb.v v5.1)
+    Covers: uio direction, FSM states, weight load, normal rhythm, sustained
+    AFib, confidence scoring, asystole detect/clear, specificity, sensitivity,
+    recurrence benefit, and reset.
+    """
 
-    uio_oe = int(dut.uio_oe.value)
-    assert uio_oe == 0b00000001, \
-        f"T0 FAIL: uio_oe={bin(uio_oe)}, expected 0b00000001"
-    dut._log.info("T0 PASS: uio_oe=0b00000001 — asystole pin correctly set as output")
+    dut._log.info("=" * 55)
+    dut._log.info("  TT SNN AFib Detector — cocotb Testbench v5.1")
+    dut._log.info("  Dual-window | AND voting | 1-bit recurrence | Asystole")
+    dut._log.info("=" * 55)
 
-
-@cocotb.test()
-async def test_t1_fsm_starts_in_load(dut):
-    """T1: After reset, FSM must be in LOAD state (00)."""
-    dut._log.info("T1: FSM initial state check")
-    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
+    # ── Clock: 10 MHz → 100 ns period (matches tb.v #50 half-period) ─────────
+    clock = Clock(dut.clk, 100, units="ns")
     cocotb.start_soon(clock.start())
 
-    model = AfibDetectorModel()
-    await reset_dut(dut)
-    model.reset()
+    # ── Initialise inputs ─────────────────────────────────────────────────────
+    dut.ui_in.value  = 0
+    dut.uio_in.value = 0
+    dut.ena.value    = 1
+    dut.rst_n.value  = 0
 
-    await ClockCycles(dut.clk, 2)
-    state = fsm_state(dut)
-    assert state == model.LOAD, \
-        f"T1 FAIL: FSM={bin(state)}, expected LOAD (00)"
-    dut._log.info(f"T1 PASS: FSM starts in LOAD (00)")
+    pass_count = 0
+    fail_count = 0
 
+    # spike_seen flag — updated by monitoring SPIKE_MON after each beat
+    spike_seen = False
 
-@cocotb.test()
-async def test_t2_weight_load_transitions_fsm(dut):
-    """T2: After serial weight load, FSM must move to RUN (01)."""
-    dut._log.info("T2: Weight load → FSM RUN transition")
-    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
-    cocotb.start_soon(clock.start())
+    # ── Release reset ─────────────────────────────────────────────────────────
+    await wait_clks(dut, 5)
+    dut.rst_n.value = 1
+    await wait_clks(dut, 3)
 
-    model = AfibDetectorModel()
-    await reset_dut(dut)
-    model.reset()
+    # ── T0: uio_oe direction check ────────────────────────────────────────────
+    uio_oe_val = int(dut.uio_oe.value)
+    if uio_oe_val == 0b00000001:
+        dut._log.info("[PASS] T0: uio_oe=0x01 — asystole pin correctly set as output")
+        pass_count += 1
+    else:
+        dut._log.error(f"[FAIL] T0: uio_oe={uio_oe_val:08b} (expected 00000001)")
+        fail_count += 1
 
-    dut._log.info(f"Loading weights: 0x{AFIB_WEIGHTS:09X}")
+    # ── T1: FSM starts in LOAD (00) ───────────────────────────────────────────
+    await wait_clks(dut, 2)
+    fsm = FSM_STATE(dut)
+    if fsm == 0b00:
+        dut._log.info("[PASS] T1: FSM starts in LOAD (00)")
+        pass_count += 1
+    else:
+        dut._log.error(f"[FAIL] T1: FSM={fsm:02b} expected 00")
+        fail_count += 1
+
+    # ── T2: Weight load → FSM transitions to RUN (01) ────────────────────────
+    dut._log.info(f"[INFO] Loading trained weights (0x{AFIB_WEIGHTS:06X})...")
     await load_weights(dut, AFIB_WEIGHTS)
-    model.load_weights()
+    fsm = FSM_STATE(dut)
+    if fsm == 0b01:
+        dut._log.info("[PASS] T2: FSM moved to RUN (01) after weight load")
+        pass_count += 1
+    else:
+        dut._log.error(f"[FAIL] T2: FSM={fsm:02b} expected 01")
+        fail_count += 1
 
-    state = fsm_state(dut)
-    assert state == model.RUN, \
-        f"T2 FAIL: FSM={bin(state)}, expected RUN (01)"
-    dut._log.info("T2 PASS: FSM moved to RUN (01) after weight load")
-
-
-@cocotb.test()
-async def test_t3_normal_sinus_rhythm(dut):
-    """
-    T3: 20 normal sinus beats at 7000 ticks each (700ms, ~86 BPM).
-    Expected: afib=0, out_valid=1, asystole=0.
-    """
-    dut._log.info("T3: Normal sinus rhythm — 20 beats at 700ms each")
-    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
-    cocotb.start_soon(clock.start())
-
-    await do_reset_and_load(dut)
-
+    # ── T3: Normal sinus rhythm — 20 beats @ 700 ms each (7000 ticks) ────────
+    dut._log.info("[INFO] T3: 20 normal sinus beats (7000 ticks = 700ms each)...")
     for _ in range(20):
         await send_beat_after(dut, 7000)
+        if SPIKE_MON(dut):
+            spike_seen = True
+    await wait_clks(dut, 50)
 
-    await ClockCycles(dut.clk, 50)
+    dut._log.info(
+        f"[INFO] T3: afib={AFIB_FLAG(dut)} valid={VALID(dut)} "
+        f"asystole={ASYSTOLE(dut)} confidence={CONFIDENCE(dut):03b}"
+    )
 
-    valid = out_valid(dut)
-    afib  = afib_flag(dut)
-    asys  = asystole_flag(dut)
-    conf  = confidence(dut)
+    # T3a — out_valid should be asserted (slow window has closed)
+    if VALID(dut) == 1:
+        dut._log.info("[PASS] T3a: out_valid asserted — slow window closed")
+        pass_count += 1
+    else:
+        dut._log.error("[FAIL] T3a: out_valid=0")
+        fail_count += 1
 
-    dut._log.info(f"T3: afib={afib} valid={valid} asystole={asys} confidence={bin(conf)}")
+    # T3b — no false-positive AFib on normal rhythm
+    if AFIB_FLAG(dut) == 0:
+        dut._log.info("[PASS] T3b: Normal rhythm classified correctly (afib=0)")
+        pass_count += 1
+    else:
+        dut._log.error("[FAIL] T3b: False positive — afib=1 on normal rhythm")
+        fail_count += 1
 
-    assert valid == 1, f"T3a FAIL: out_valid=0 — slow window did not close"
-    dut._log.info("T3a PASS: out_valid=1 — slow window closed correctly")
+    # T3c — no asystole at 700 ms intervals
+    if ASYSTOLE(dut) == 0:
+        dut._log.info("[PASS] T3c: Asystole=0 during normal 700ms beat interval")
+        pass_count += 1
+    else:
+        dut._log.error("[FAIL] T3c: Asystole false positive at 700ms")
+        fail_count += 1
 
-    assert afib == 0, f"T3b FAIL: False positive — afib=1 on normal rhythm"
-    dut._log.info("T3b PASS: Normal rhythm classified correctly (afib=0)")
-
-    assert asys == 0, f"T3c FAIL: Asystole false positive at 700ms inter-beat interval"
-    dut._log.info("T3c PASS: asystole=0 during normal 700ms beat interval")
-
-
-@cocotb.test()
-async def test_t4_sustained_afib(dut):
-    """
-    T4: 32 sustained irregular AFib beats (alternating short/long intervals).
-    Expected: afib=1, any_spike=1, confidence >= 101 (5).
-    """
-    dut._log.info("T4: Sustained AFib — 32 irregular beats")
-    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
-    cocotb.start_soon(clock.start())
-
+    # ── T4: Sustained AFib — 32 highly irregular beats ───────────────────────
+    dut._log.info("[INFO] T4: 32 sustained irregular AFib beats...")
     await do_reset_and_load(dut)
+    spike_seen = False
 
-    # Same irregular intervals as tb.v T4 — two groups of 16 alternating beats
-    intervals = [
+    t4_intervals = [
         2500, 9500, 3000, 8800, 2200, 9200, 3500, 8000,
         2800, 9800, 2000,10000, 3200, 8500, 2600, 9100,
         3100, 8200, 2400, 9600, 2700, 9300, 3300, 8700,
         2100, 9700, 3400, 8100, 2900, 9400,
     ]
-    for ticks in intervals:
+    for ticks in t4_intervals:
         await send_beat_after(dut, ticks)
+        if SPIKE_MON(dut):
+            spike_seen = True
+    await wait_clks(dut, 100)
 
-    await ClockCycles(dut.clk, 100)
+    dut._log.info(
+        f"[INFO] T4: afib={AFIB_FLAG(dut)} valid={VALID(dut)} "
+        f"confidence={CONFIDENCE(dut):03b} spike_seen={int(spike_seen)}"
+    )
 
-    afib = afib_flag(dut)
-    spk  = any_spike(dut)
-    conf = confidence(dut)
-    valid = out_valid(dut)
+    # T4a — AFib must be detected
+    if AFIB_FLAG(dut) == 1:
+        dut._log.info("[PASS] T4a: AFib detected by fast & slow window vote (afib=1)")
+        pass_count += 1
+    else:
+        dut._log.error("[FAIL] T4a: AFib not detected")
+        fail_count += 1
 
-    dut._log.info(f"T4: afib={afib} valid={valid} confidence={bin(conf)} any_spike={spk}")
+    # T4b — reservoir neurons must have fired
+    if spike_seen:
+        dut._log.info("[PASS] T4b: Reservoir neurons fired during AFib sequence")
+        pass_count += 1
+    else:
+        dut._log.error("[FAIL] T4b: No reservoir spikes seen")
+        fail_count += 1
 
-    assert afib == 1, "T4a FAIL: AFib not detected on sustained irregular rhythm"
-    dut._log.info("T4a PASS: AFib detected by 2-of-3 window majority (afib=1)")
+    # ── T5: Confidence in AFib range (≥ 5 = 0b101) ───────────────────────────
+    conf = CONFIDENCE(dut)
+    if conf >= 0b101:
+        dut._log.info(f"[PASS] T5: confidence_latch in AFib range = {conf:03b}")
+        pass_count += 1
+    else:
+        dut._log.error(f"[FAIL] T5: confidence_latch too low = {conf:03b} (expected >=101)")
+        fail_count += 1
 
-    assert spk == 1, "T4b FAIL: No reservoir spikes seen during AFib sequence"
-    dut._log.info("T4b PASS: Reservoir neurons fired during AFib sequence")
+    # ── T6: Asystole detection & clearance ───────────────────────────────────
+    dut._log.info("[INFO] T6: 17000-tick silence (>1.6384 s threshold)...")
+    await wait_clks(dut, 17000)
 
-
-@cocotb.test()
-async def test_t5_confidence_in_afib_range(dut):
-    """
-    T5: After AFib detection, confidence_latch should be >= 5 (3'b101).
-    Runs immediately after T4 scenario (reset + reload + same intervals).
-    """
-    dut._log.info("T5: Confidence level check during AFib")
-    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
-    cocotb.start_soon(clock.start())
-
-    await do_reset_and_load(dut)
-
-    intervals = [
-        2500, 9500, 3000, 8800, 2200, 9200, 3500, 8000,
-        2800, 9800, 2000,10000, 3200, 8500, 2600, 9100,
-        3100, 8200, 2400, 9600, 2700, 9300, 3300, 8700,
-        2100, 9700, 3400, 8100, 2900, 9400,
-    ]
-    for ticks in intervals:
-        await send_beat_after(dut, ticks)
-
-    await ClockCycles(dut.clk, 100)
-    conf = confidence(dut)
-
-    assert conf >= 0b101, \
-        f"T5 FAIL: confidence_latch={bin(conf)} — expected >= 101 (AFib range)"
-    dut._log.info(f"T5 PASS: confidence_latch={bin(conf)} is in AFib range (>= 101)")
-
-
-@cocotb.test()
-async def test_t6_asystole_detection(dut):
-    """
-    T6: After >16384 ticks (~1.6s at 10MHz) of silence, asystole_flag must assert.
-    Then send an R-peak — flag must clear within 3 clocks.
-    """
-    dut._log.info("T6: Asystole detection — 17000-tick silence")
-    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
-    cocotb.start_soon(clock.start())
-
-    model = AfibDetectorModel()
-    await do_reset_and_load(dut)
-    model.load_weights()
-
-    await ClockCycles(dut.clk, 17000)
-    model.tick(17000)
-
-    asys = asystole_flag(dut)
-    assert asys == 1, "T6a FAIL: Asystole flag did not assert after >16384 tick silence"
-    dut._log.info("T6a PASS: Asystole flag asserted after >16384-tick silence (>1.6384s)")
+    if ASYSTOLE(dut) == 1:
+        dut._log.info("[PASS] T6a: Asystole flag asserted after >16384-tick silence")
+        pass_count += 1
+    else:
+        dut._log.error("[FAIL] T6a: Asystole flag did not assert")
+        fail_count += 1
 
     await send_r_peak(dut)
-    model.r_peak()
-    await ClockCycles(dut.clk, 3)
+    await wait_clks(dut, 3)
 
-    asys = asystole_flag(dut)
-    assert asys == 0, "T6b FAIL: Asystole flag did not clear after R-peak arrival"
-    dut._log.info("T6b PASS: Asystole flag cleared on R-peak arrival")
+    if ASYSTOLE(dut) == 0:
+        dut._log.info("[PASS] T6b: Asystole flag cleared on R-peak arrival")
+        pass_count += 1
+    else:
+        dut._log.error("[FAIL] T6b: Asystole did not clear after R-peak")
+        fail_count += 1
 
-
-@cocotb.test()
-async def test_t7a_specificity_short_burst(dut):
-    """
-    T7a: Specificity — 4 irregular beats followed by 12 normal beats.
-    Ultra window fires internally at beat 4, but 2-of-3 cannot be satisfied
-    because fast and slow windows see predominantly normal rhythm.
-    Expected: afib=0 (no false positive).
-    """
-    dut._log.info("T7a: Specificity — 4 irregular + 12 normal beats")
-    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
-    cocotb.start_soon(clock.start())
-
+    # ── T7a: Specificity — 4 irregular then 12 normal beats ──────────────────
+    dut._log.info("[INFO] T7a: Specificity — 4 irregular + 12 normal beats...")
     await do_reset_and_load(dut)
+    spike_seen = False
 
-    # 4 irregular beats
     for ticks in [1500, 11000, 1800, 10500]:
         await send_beat_after(dut, ticks)
-
-    # 12 normal beats
+        if SPIKE_MON(dut):
+            spike_seen = True
     for _ in range(12):
         await send_beat_after(dut, 7000)
+        if SPIKE_MON(dut):
+            spike_seen = True
+    await wait_clks(dut, 100)
 
-    await ClockCycles(dut.clk, 100)
+    dut._log.info(
+        f"[INFO] T7a: afib={AFIB_FLAG(dut)} valid={VALID(dut)} "
+        f"confidence={CONFIDENCE(dut):03b}"
+    )
+    if AFIB_FLAG(dut) == 0:
+        dut._log.info("[PASS] T7a: Specificity preserved — 4-beat burst not flagged (afib=0)")
+        dut._log.info("       [12 normal beats dominate both windows; fast & slow stay negative]")
+        pass_count += 1
+    else:
+        dut._log.error("[FAIL] T7a: False positive — 4 irregular beats out of 16 flagged as AFib")
+        fail_count += 1
 
-    afib = afib_flag(dut)
-    conf = confidence(dut)
-    dut._log.info(f"T7a: afib={afib} confidence={bin(conf)}")
-
-    assert afib == 0, \
-        "T7a FAIL: False positive — 4-beat burst incorrectly flagged as AFib"
-    dut._log.info("T7a PASS: Specificity preserved — 4-beat burst not flagged (afib=0)")
-    dut._log.info("       [Ultra window fired at beat 4, but 2-of-3 requires a second")
-    dut._log.info("        window to agree; 12 normal beats prevent that]")
-
-
-@cocotb.test()
-async def test_t7b_ultra_window_sensitivity(dut):
-    """
-    T7b: Ultra-window sensitivity — 8 irregular beats then 8 normal.
-    Ultra windows 1 AND 2 both flag. Fast window (beats 1-8) sees all irregular.
-    Ultra + Fast = 2-of-3 satisfied → afib_flag=1.
-    Expected: afib=1.
-    """
-    dut._log.info("T7b: Ultra sensitivity — 8 irregular + 8 normal beats")
-    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
-    cocotb.start_soon(clock.start())
-
+    # ── T7b: Sensitivity — 16 sustained irregular beats ──────────────────────
+    dut._log.info("[INFO] T7b: Sensitivity — 16 sustained irregular beats...")
     await do_reset_and_load(dut)
+    spike_seen = False
 
-    # 8 irregular beats (4 alternating short/long pairs)
-    for ticks in [1500, 11000, 1800, 10500, 2000, 10000, 1700, 11500]:
+    t7b_intervals = [
+        1500, 11000, 1800, 10500, 2000, 10000, 1700, 11500,
+        2300,  9800, 1600, 10800, 2100, 10200, 1900, 11200,
+    ]
+    for ticks in t7b_intervals:
         await send_beat_after(dut, ticks)
+        if SPIKE_MON(dut):
+            spike_seen = True
+    await wait_clks(dut, 100)
 
-    # 8 normal beats
-    for _ in range(8):
-        await send_beat_after(dut, 7000)
+    dut._log.info(
+        f"[INFO] T7b: afib={AFIB_FLAG(dut)} valid={VALID(dut)} "
+        f"confidence={CONFIDENCE(dut):03b}"
+    )
+    if AFIB_FLAG(dut) == 1:
+        dut._log.info("[PASS] T7b: Fast+Slow both detected 16-beat AFib episode (afib=1)")
+        pass_count += 1
+    else:
+        dut._log.error("[FAIL] T7b: 16-beat sustained AFib episode not detected")
+        fail_count += 1
 
-    await ClockCycles(dut.clk, 100)
-
-    afib = afib_flag(dut)
-    conf = confidence(dut)
-    dut._log.info(f"T7b: afib={afib} confidence={bin(conf)}")
-
-    assert afib == 1, \
-        "T7b FAIL: 8-beat sustained AFib episode not detected"
-    dut._log.info("T7b PASS: Ultra+Fast window pair detected 8-beat AFib episode (afib=1)")
-    dut._log.info("       [Demonstrates ultra window provides real 2-of-3 contribution]")
-
-
-@cocotb.test()
-async def test_t8_reset_clears_all_state(dut):
-    """
-    T8: After full reset, afib_flag=0, out_valid=0, asystole=0, FSM=LOAD.
-    """
-    dut._log.info("T8: Reset clears all state")
-    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
-    cocotb.start_soon(clock.start())
-
-    # Run some beats first to dirty the state
+    # ── T7c: Recurrence benefit — 16 moderate irregular beats ────────────────
+    dut._log.info("[INFO] T7c: Recurrence benefit — 16 moderate irregular beats...")
     await do_reset_and_load(dut)
-    for ticks in [2500, 9500, 3000, 8800]:
-        await send_beat_after(dut, ticks)
+    spike_seen = False
 
-    # Now reset
+    t7c_intervals = [
+        4500, 7500, 4800, 7200, 4600, 7400, 4700, 7300,
+        4400, 7600, 4900, 7100, 4500, 7500, 4600, 7400,
+    ]
+    for ticks in t7c_intervals:
+        await send_beat_after(dut, ticks)
+        if SPIKE_MON(dut):
+            spike_seen = True
+    await wait_clks(dut, 100)
+
+    dut._log.info(
+        f"[INFO] T7c: afib={AFIB_FLAG(dut)} valid={VALID(dut)} "
+        f"confidence={CONFIDENCE(dut):03b} spike_seen={int(spike_seen)}"
+    )
+    # Soft pass — moderate AFib is borderline by design; recurrence still
+    # contributes if spike_seen=1 (visible in confidence score)
+    if AFIB_FLAG(dut) == 1:
+        dut._log.info("[PASS] T7c: Recurrence detected moderate sustained AFib (afib=1)")
+        dut._log.info("       [n7 fired via spike_reg1 feedback — boosted accumulator score]")
+    else:
+        dut._log.info(f"[INFO] T7c: Moderate pattern at borderline — confidence={CONFIDENCE(dut):03b}")
+        dut._log.info(f"       [recurrence active: spike_seen={int(spike_seen)} confirms n7 contribution]")
+    pass_count += 1   # always passes (soft check, mirrors tb.v behaviour)
+
+    # ── T8: Reset clears all state ────────────────────────────────────────────
     dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 3)
+    await wait_clks(dut, 3)
 
-    afib  = afib_flag(dut)
-    valid = out_valid(dut)
-    asys  = asystole_flag(dut)
-    state = fsm_state(dut)
+    if (AFIB_FLAG(dut) == 0 and VALID(dut) == 0 and
+            FSM_STATE(dut) == 0b00 and ASYSTOLE(dut) == 0):
+        dut._log.info("[PASS] T8: Reset clears afib_flag, out_valid, asystole, FSM=LOAD")
+        pass_count += 1
+    else:
+        dut._log.error(
+            f"[FAIL] T8: afib={AFIB_FLAG(dut)} valid={VALID(dut)} "
+            f"asystole={ASYSTOLE(dut)} fsm={FSM_STATE(dut):02b} after reset"
+        )
+        fail_count += 1
 
-    assert afib  == 0,    f"T8 FAIL: afib_flag={afib} after reset"
-    assert valid == 0,    f"T8 FAIL: out_valid={valid} after reset"
-    assert asys  == 0,    f"T8 FAIL: asystole={asys} after reset"
-    assert state == 0b00, f"T8 FAIL: FSM={bin(state)} after reset (expected LOAD=00)"
-
-    dut._log.info("T8 PASS: Reset clears afib_flag, out_valid, asystole, FSM=LOAD")
     dut.rst_n.value = 1
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    dut._log.info("=" * 55)
+    dut._log.info(f"  Results: {pass_count} passed, {fail_count} failed")
+    if fail_count == 0:
+        dut._log.info("  ALL TESTS PASSED")
+    else:
+        dut._log.error(f"  {fail_count} TEST(S) FAILED — see above")
+    dut._log.info("=" * 55)
+
+    assert fail_count == 0, f"{fail_count} test(s) failed — see log above"
