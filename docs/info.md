@@ -4,68 +4,108 @@ Leaving "How it works" or "How to test" as template text causes the docs CI to f
 -->
 
 
-
 ## How it works
 
-### What problem does this chip solve?
+---
 
-Atrial fibrillation (AFib) is the world's most common cardiac arrhythmia, affecting
-60+ million people globally. It is intermittent, frequently asymptomatic (70% of episodes
-go unnoticed), and carries a **5× higher stroke risk** if undetected. Existing wearable
-detectors solve this by duty-cycling a processor — waking a Cortex-M4 or similar
-every few seconds to run inference. That wake-compute-sleep cycle consumes 5–50 mW
-and still misses the brief paroxysmal episodes that matter most clinically.
 
-This chip **eliminates the processor entirely.** Inference runs continuously inside the
-spike dynamics of silicon neurons, consuming switching energy only when a heartbeat
-arrives — roughly once per second at rest. The chip simultaneously detects AFib
-(too irregular) and bradycardia/asystole (too slow or absent), making it a
-two-class always-on cardiac monitor in 959 standard cells.
 
-### Why this architecture is novel
+#### What is the problem?
 
-Every conventional wearable neural network — from the Apple Watch to AliveCor KardiaMobile —
-is fundamentally a multiply-accumulate engine running on a processor. This chip has
-**zero multipliers anywhere in the design.** It uses:
+AFib is the world's most common heart rhythm disorder — 60 million people have it,
+and **70% of episodes go completely unnoticed** because it comes and goes without
+causing symptoms. If missed, it carries a **5× higher stroke risk.** Catching it
+requires watching the heart continuously, not just during a doctor's visit.
 
-- **Leaky integrate-and-fire neurons** where the "leak" is a right-shift (one wire, zero gates)
-- **Shift-add arithmetic** for the readout accumulator
-- **Bit-select comparators** replacing adder-comparator pairs (saves ~6 cells per threshold)
-- **Event-driven computation** — the entire chip is gated by `spike_valid`, consuming
-  dynamic power only once per heartbeat
+Today's wearable heart monitors solve this by waking up a small computer every few
+seconds, running a calculation, and going back to sleep. The problem is that waking
+a processor is expensive in battery terms, and in the gaps between wakeups, a brief
+AFib episode can start and end without ever being seen.
 
-This is not just an accelerator for a known algorithm. The silicon dynamics
-**are** the algorithm. The reservoir's temporal memory cannot be replicated in software
-without simulating every clock cycle — the computation is physically embodied in the
-membrane potential state of the flip-flops between heartbeats.
+#### What does this chip do differently?
 
-### Signal pipeline
+This chip **has no processor at all.** Instead, it uses eight tiny artificial neurons
+etched directly into silicon. These neurons sit idle between heartbeats, drawing
+almost no power. The moment a heartbeat arrives, they wake up, process it in
+microseconds, and go idle again — all inside 959 logic cells, roughly the complexity
+of a simple digital watch.
 
-One R-peak pulse enters. Two arrhythmia flags exit. The pipeline has five stages,
-each triggered once per heartbeat by the `spike_valid` gate:
+It watches for two things simultaneously:
+
+- **AFib** — a heartbeat pattern that is chaotically irregular over time
+- **Asystole / bradycardia** — a heartbeat that has slowed dangerously or stopped
+
+One pulse in. Two alarm flags out. No processor. No software. No battery-draining
+wake-sleep cycle.
+
+---
+
+
+
+#### The five-stage pipeline
+
+Every time the heart beats, one digital pulse arrives at the chip's input pin.
+That pulse triggers a five-stage pipeline — each stage finishes in microseconds,
+then the chip goes quiet until the next beat.
+
+**Stage 1 — Measure the gap (rr_features)**
+The chip counts clock ticks between consecutive heartbeats. This gives two numbers:
+how long since the last beat (the RR interval — a proxy for heart rate), and how
+much that gap just changed compared to the beat before (the beat-to-beat variability,
+medically called RMSSD). If no beat arrives for more than 1.6 seconds, the asystole
+alarm fires immediately.
+
+**Stage 2 — Encode as spikes (spike_encoder)**
+Both numbers are compressed into short binary patterns — the same way the brain
+encodes sensory information as bursts of electrical spikes. Faster heart rate →
+more spikes. Larger beat-to-beat swing → more spikes. This is what the neurons
+understand.
+
+**Stage 3 — The reservoir (8 LIF neurons)**
+Eight neurons receive the spike patterns. Four watch the heart rate, four watch the
+variability. Each neuron has its own sensitivity — some fire on small signals, others
+only on large ones. Crucially, one neuron (n7) also receives a one-beat memory of
+what happened last beat. This means the network can tell the difference between a
+single abnormal beat (happens in normal hearts) and a pattern of sustained abnormality
+(the hallmark of AFib). The neurons fire or stay silent — their combined firing
+pattern is the feature vector fed to the final stage.
+
+**Stage 4 — Classify and vote (readout)**
+Each neuron's firing is multiplied by a pre-loaded signed weight (positive = votes
+for AFib, negative = votes against). The sum is accumulated over two time windows:
+a fast window (8 beats, ~5 seconds) and a slow window (16 beats, ~11 seconds).
+**Both windows must independently agree** before the AFib flag is raised. A single
+irregular beat triggers the fast window but not the slow — preventing false alarms
+from isolated ectopic beats, which are common and harmless.
+
+**Stage 5 — Output**
+`afib_flag` goes HIGH. A 3-bit confidence score indicates how strongly both windows
+agreed. The system resets and starts watching the next 16 beats.
 
 ![Signal Pipeline](./SP.jpeg)
 
-### Why fixed random reservoir weights still work — Echo State Property
+#### Why the memory matters — one bit that changes everything
 
-The reservoir uses **fixed weights baked in at synthesis time** as Verilog parameters.
-The natural question is: why does a random fixed network produce useful classification?
+In normal rhythm, beat intervals are consistent. The memory register (`spike_reg1`)
+that carries n0's output into n7 stays mostly quiet because consecutive beats look
+similar. In AFib, intervals are chaotically variable — n0 fires on one beat, that
+feeds into n7 the next beat, which fires and adds to the accumulator, which feeds
+back into the next cycle. The score **compounds** across beats. A single ectopic beat
+doesn't compound — it fires once and disappears. **Sustained irregularity is
+self-reinforcing in this architecture. That is the detection mechanism.**
 
-The answer is Jaeger's **Echo State Property** (2001): a reservoir with sufficient
-recurrence and contractivity maps any input sequence to a unique, reproducible internal
-state trajectory — a high-dimensional nonlinear projection of the input history.
-The linear readout only needs to find a separating hyperplane in that projected space,
-which is a much simpler learning problem than training the full network.
+#### Self-adapting thresholds
 
-In this design, the **`spike_reg1`** feedback register (n0's output at beat t → n7's
-input at beat t+1) is the architectural element that makes the LSM framing correct.
-Without it, the network is purely feedforward and has no cross-beat memory.
-With it, n7's state at beat t encodes both the current HRV delta **and** the rhythm
-state from the previous beat — giving the reservoir genuine temporal memory of
-sustained vs. transient irregularity. A single ectopic beat (transient) leaves
-`spike_reg1` unchanged the following beat. Sustained AFib (persistent) keeps
-`spike_reg1` high across consecutive beats, systematically boosting the
-accumulator score. **This is the classification mechanism.**
+Each neuron's firing threshold is not permanently fixed. Every 16 beats, the chip
+checks how active the reservoir has been and nudges all thresholds up (if neurons
+are firing too readily) or down (if they're too quiet). This means the chip
+automatically recalibrates to a patient's normal baseline heart rate over time —
+a fast athlete and a resting elderly patient will both eventually be monitored
+correctly without any manual tuning.
+
+---
+
+
 
 ### Why this is harder than it looks — complexity at 959 cells
 
@@ -427,17 +467,31 @@ fires exactly once per beat at the R-peak.
 
 
 
-### Honest limitations
+### Future work
 
-- **Not a medical device.** Verified on synthetic RR sequences and a Python model
-  of PhysioNet MIT-BIH data. Not validated in a clinical study or on real silicon.
-- **Single-lead timing only.** No waveform morphology. Cannot distinguish PVC,
-  SVT, or flutter from AFib — only rhythm irregularity and rate.
-- **10 kHz system clock on the demo board.** The RP2040 on the TT demo board must drive `clk` at **10 kHz** (1 tick = 100 µs). At this frequency a real 700 ms heartbeat interval = 7,000 ticks — well within the 16-bit counter range (max 65,535 ticks = 6.55 s). At 10 MHz the counter would overflow on every beat (700 ms = 7,000,000 ticks >> 65,535). The testbench runs at 10 MHz with compressed inter-beat gaps (7,000 ticks = 700 µs in sim, not 700 ms in real time) purely to keep simulation fast. The asystole threshold (bit 14 = 16,384 ticks = 1.64 s) and all RR interval bins are **calibrated for the 10 kHz demo clock**. Weight vector `0x051A08` was optimised at this clock. At other frequencies all interval bins shift proportionally and the weights must be retrained.
-- **Weight retraining for real deployment.** The default weights were derived
-  analytically from synthetic RR distributions. For real patients, retrain
-  the 8 readout weights on MIT-BIH PhysioNet data and reload via the serial
-  interface (`ui_in[3:1]`) — no re-tapeout needed.
-- **16-beat minimum before first flag.** The slow window requires 16 beats
-  (~13 s at 75 BPM) before `out_valid` first asserts. This is by design —
-  it implements the ESC 2020 "sustained irregularity" criterion.
+This tapeout establishes the core SNN inference engine. Several natural extensions
+would take it from a proof-of-concept to a clinically deployable device:
+
+- **Multi-arrhythmia classification.** The current design detects two conditions
+  (AFib and asystole/bradycardia). Expanding the reservoir to 16 neurons and adding
+  a second readout layer would enable discrimination of PVC, SVT, and atrial flutter
+  — all rhythm-based conditions that are separable in RR-interval feature space
+  without requiring waveform morphology.
+
+- **Clock-adaptive interval encoding.** The RR interval bins are currently
+  calibrated for the 10 kHz demo board clock (1 tick = 100 µs, 700 ms beat =
+  7,000 ticks). A future revision could include a one-time calibration register
+  that scales the tick-to-interval mapping at runtime, making the chip
+  clock-independent and deployable at any system frequency without weight retraining.
+
+- **On-chip STDP weight update.** The serial weight interface already supports
+  runtime weight updates. A future version could add a lightweight Spike-Timing
+  Dependent Plasticity (STDP) block (~25 gates) that incrementally adjusts weights
+  based on physician-confirmed events — enabling true patient-specific adaptation
+  without a retraining pipeline.
+
+- **Full wearable SoC integration.** The chip's event-driven architecture
+  makes it a natural always-on front-end for a BLE SoC. Pairing it with an
+  nRF52 or ESP32 in deep sleep — waking only on `afib_flag` or `asystole_flag`
+  assertion — would yield a complete cardiac monitor with sub-μW average power
+  on the detection path, suitable for multi-year coin cell operation.
