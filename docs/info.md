@@ -3,14 +3,7 @@ Tiny Tapeout docs/info.md — SNN AFib Detector
 Leaving "How it works" or "How to test" as template text causes the docs CI to fail.
 -->
 
-# SNN AFib Detector — Spiking Reservoir Computing Core
 
-- GitHub user: SanjayKrishna2005
-- [How it works](#how-it-works)
-- [How to test](#how-to-test)
-- [External hardware](#external-hardware)
-
----
 
 ## How it works
 
