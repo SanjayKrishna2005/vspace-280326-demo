@@ -5,7 +5,7 @@ Leaving "How it works" or "How to test" as template text causes the docs CI to f
 
 # SNN AFib Detector — Spiking Reservoir Computing Core
 
-- GitHub user: <!-- your github username -->
+- GitHub user: SanjayKrishna2005
 - [How it works](#how-it-works)
 - [How to test](#how-to-test)
 - [External hardware](#external-hardware)
