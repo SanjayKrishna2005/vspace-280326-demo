@@ -44,64 +44,7 @@ membrane potential state of the flip-flops between heartbeats.
 One R-peak pulse enters. Two arrhythmia flags exit. The pipeline has five stages,
 each triggered once per heartbeat by the `spike_valid` gate:
 
-```
-ui_in[0] ─── r_peak pulse (1 clock wide, once per beat)
-                  │
-                  ▼
-        ┌─────────────────┐
-        │   rr_features   │  ← Stage 1
-        │                 │  16-bit tick counter measures inter-beat gap.
-        │  tick_count[15:9]│  Compresses to 6-bit rr_interval (64 bins).
-        │  |delta|        │  Computes |RR[n] − RR[n-1]| = rr_delta ≈ RMSSD.
-        │  tick[15|14]    │  Bit-select → asystole_flag if gap > 1.64 s.
-        │                 │  At 10 kHz: 1 tick = 100 µs; counter fits real
-        │                 │  heartbeat intervals (700ms = 7,000 ticks, well
-        │                 │  within 16-bit max of 65,535 ticks = 6.55 s).
-        └────────┬────────┘
-                 │ rr_interval[5:0], rr_delta[5:0]
-                 ▼
-        ┌─────────────────┐
-        │  spike_encoder  │  ← Stage 2
-        │                 │  Rate-codes both features into 4-bit spike vectors.
-        │  15−rr[5:2]     │  spike_interval: inverted (fast HR → more spikes)
-        │  min(delta,15)  │  spike_delta: direct (large HRV → more spikes)
-        └────────┬────────┘
-                 │ spike_interval[3:0], spike_delta[3:0]
-                 ▼
-        ┌──────────────────────────────────────┐
-        │         reservoir (8 LIF neurons)    │  ← Stage 3
-        │                                      │
-        │  n0–n3: spike_interval[3:0]          │  Rhythm/rate detectors
-        │  n4–n7: spike_delta[3:0]             │  HRV irregularity detectors
-        │                                      │
-        │  spike_reg1: n0[t-1] → n7[t]        │  1-bit recurrence:
-        │  n7 fires if delta high NOW          │  makes reservoir a true LSM
-        │    OR interval was irregular LAST    │  (Echo State Property satisfied)
-        │                                      │
-        │  Each LIF: V = (V>>1) + W·spike_in  │  Leak = right-shift (0 gates)
-        │            fires when V ≥ THRESHOLD  │  4-bit potential, event-driven
-        └────────┬─────────────────────────────┘
-                 │ neuron_spikes[7:0], any_spike
-                 ▼
-        ┌──────────────────────────────────────┐
-        │    readout (dual-window classifier)   │  ← Stage 4
-        │                                      │
-        │  24-bit signed weight SR (8×3-bit)   │  Loaded once at boot via SPI
-        │                                      │
-        │  cycle_sum = Σ w[i]·spike[i]         │  Signed shift-add, no multiply
-        │                                      │
-        │  Fast window (8 beats):              │  ~5.6 s — acute AFib onset
-        │  Slow window (16 beats):             │  ~11.2 s — sustained AFib
-        │                                      │
-        │  afib_flag = fast AND slow           │  Both must agree (AND vote)
-        │  confidence_latch[2:0]               │  3-bit graded output
-        └────────┬─────────────────────────────┘
-                 │
-                 ▼
-        uo_out[0]: afib_flag       uo_out[7:5]: confidence_latch
-        uo_out[1]: out_valid       uio_out[0]:  asystole_flag
-        uo_out[2]: any_spike
-```
+![Signal Pipeline](./SP.jpeg)
 
 ### Why fixed random reservoir weights still work — Echo State Property
 
@@ -494,7 +437,7 @@ LM393 comparator (threshold ~0.5V)
   ├──────────────────────────────────────┐
   │                                      │
   ▼                                      │
-ui_in[0] → [SNN AFib Detector]          │
+ui_in[0] → [SNN AFib Detector]           │
            959 cells, SKY130A            │
            Always-on, event-driven       │
            ↓           ↓                 │
