@@ -7,7 +7,7 @@ module readout (
     input  wire        w_load,
     input  wire        w_data,
     input  wire        w_clk,
-    input  wire [7:0]  neuron_spikes,   // reduced from 11 to 8
+    input  wire [7:0]  neuron_spikes,   
     input  wire        spike_valid,
     output reg         afib_flag,
     output reg         out_valid,
@@ -16,7 +16,7 @@ module readout (
     output reg  [2:0]  confidence_latch
 );
 
-    // ── Parameters ───────────────────────────────────────────────────────────
+    // Parameters
     localparam FAST_WINDOW  = 4'd8;             // 8 beats
     localparam SLOW_WINDOW  = 5'd16;            // 16 beats
 
@@ -27,7 +27,7 @@ module readout (
     localparam RUN    = 2'b01;
     localparam OUTPUT = 2'b10;
 
-    // ── Weight shift register (24-bit for 8 neurons × 3 bits) ────────────────
+    
     reg [23:0] weight_sr;
     reg        w_clk_prev;
     reg        w_load_seen;
@@ -37,7 +37,7 @@ module readout (
     wire [2:0] w4  = weight_sr[14:12];  wire [2:0] w5  = weight_sr[17:15];
     wire [2:0] w6  = weight_sr[20:18];  wire [2:0] w7  = weight_sr[23:21];
 
-    // ── Sign-extend 3-bit 2's complement weights to 9-bit signed ─────────────
+    // Sign-extend 3-bit 2's complement weights to 9-bit signed 
     wire signed [8:0] ws0  = {{6{w0[2]}},  w0};
     wire signed [8:0] ws1  = {{6{w1[2]}},  w1};
     wire signed [8:0] ws2  = {{6{w2[2]}},  w2};
@@ -57,16 +57,16 @@ module readout (
     wire signed [8:0] c6  = neuron_spikes[6] ? ws6 : 9'sd0;
     wire signed [8:0] c7  = neuron_spikes[7] ? ws7 : 9'sd0;
 
-    // ── Per-beat signed sum across all 8 neurons ──────────────────────────────
+ 
     wire signed [12:0] cycle_sum =
         $signed(c0) + $signed(c1) + $signed(c2) + $signed(c3) +
         $signed(c4) + $signed(c5) + $signed(c6) + $signed(c7);
 
-    // Truncated views fed to each window accumulator
-    wire signed [8:0]  cycle_fast = cycle_sum[8:0];   // 9-bit for fast
-    wire signed [9:0]  cycle_slow = cycle_sum[9:0];   // 10-bit for slow
+    
+    wire signed [8:0]  cycle_fast = cycle_sum[8:0];   
+    wire signed [9:0]  cycle_slow = cycle_sum[9:0];   
 
-    // ── Window accumulators ───────────────────────────────────────────────────
+    // Window accumulators 
     // FAST (8-beat)
     reg signed [8:0]  accum_fast;
     reg [3:0]         beat_fast;
@@ -78,7 +78,7 @@ module readout (
     reg [4:0]         beat_slow;
     reg               afib_slow;
 
-    // ── Live confidence from fast-window snapshot ─────────────────────────────
+   
     assign confidence =
         (accum_fast_snap >= FAST_THRESH + 9'sd8) ? 3'b111 :
         (accum_fast_snap >= FAST_THRESH + 9'sd4) ? 3'b110 :
@@ -86,7 +86,7 @@ module readout (
         (accum_fast_snap <= FAST_THRESH - 9'sd8) ? 3'b000 :
         (accum_fast_snap <= FAST_THRESH - 9'sd4) ? 3'b001 : 3'b010;
 
-    // ── Main FSM ──────────────────────────────────────────────────────────────
+    // Main FSM 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             weight_sr        <= 24'b0;

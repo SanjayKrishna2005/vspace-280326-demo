@@ -11,9 +11,9 @@ module tt_um_snn_afib_detector (
     input  wire       clk,
     input  wire       rst_n
 );
-    // uio[0] is an output (asystole_flag); all others are inputs (driven low)
+    // uio[0] is an output (asystole_flag)
     assign uio_out[7:1] = 7'b0;
-    assign uio_oe       = 8'b0000_0001;   // only bit 0 is output
+    assign uio_oe       = 8'b0000_0001;   
 
     wire r_peak = ui_in[0];
     wire w_load = ui_in[1];

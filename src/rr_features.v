@@ -34,7 +34,7 @@ module rr_features (
             rr_valid    <= 1'b0;
 
             if (r_peak_rise) begin
-                // New beat: compute interval and delta, then clear counter
+               
                 rr_interval   <= (tick_count[15:9] > 7'd63)
                                  ? 6'd63 : tick_count[15:9];
                 rr_delta      <= (tick_count[15:9] > rr_prev)
